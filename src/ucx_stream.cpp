@@ -114,7 +114,7 @@ void UcxStreamLane::init_ucx() {
 
   ucp_params_t params{};
   params.field_mask = UCP_PARAM_FIELD_FEATURES;
-  params.features = UCP_FEATURE_STREAM;
+  params.features = UCP_FEATURE_STREAM | UCP_FEATURE_TAG;
   check_status(ucp_init(&params, config_, &context_), "ucp_init");
 
   ucp_worker_params_t worker_params{};
@@ -248,6 +248,61 @@ void UcxStreamLane::send_all(const void *data, size_t length) {
     remaining -= n;
   }
 }
+
+void *UcxStreamLane::post_tag_send(const void *data, size_t length, ucp_tag_t tag) {
+  ucp_request_param_t params{};
+  ucs_status_ptr_t request = ucp_tag_send_nbx(ep_, data, length, tag, &params);
+  if (UCS_PTR_IS_ERR(request)) {
+    throw std::runtime_error("ucp_tag_send_nbx: " +
+                             std::string(ucs_status_string(UCS_PTR_STATUS(request))));
+  }
+  return request;
+}
+
+void *UcxStreamLane::post_tag_recv(void *data, size_t length, ucp_tag_t tag,
+                                  ucp_tag_t tag_mask,
+                                  UcxRecvResult *immediate) {
+  ucp_tag_recv_info_t info{};
+  ucp_request_param_t params{};
+  params.op_attr_mask = UCP_OP_ATTR_FIELD_RECV_INFO;
+  params.recv_info.tag_info = &info;
+  ucs_status_ptr_t request =
+      ucp_tag_recv_nbx(worker_, data, length, tag, tag_mask, &params);
+  if (UCS_PTR_IS_ERR(request)) {
+    throw std::runtime_error("ucp_tag_recv_nbx: " +
+                             std::string(ucs_status_string(UCS_PTR_STATUS(request))));
+  }
+  if (request == nullptr && immediate != nullptr) {
+    immediate->tag = info.sender_tag;
+    immediate->length = info.length;
+  }
+  return request;
+}
+
+bool UcxStreamLane::test_send(void *request) {
+  const ucs_status_t status = ucp_request_check_status(request);
+  if (status == UCS_INPROGRESS) {
+    return false;
+  }
+  ucp_request_free(request);
+  check_status(status, "ucx tag send");
+  return true;
+}
+
+bool UcxStreamLane::test_recv(void *request, UcxRecvResult &result) {
+  ucp_tag_recv_info_t info{};
+  const ucs_status_t status = ucp_tag_recv_request_test(request, &info);
+  if (status == UCS_INPROGRESS) {
+    return false;
+  }
+  ucp_request_free(request);
+  check_status(status, "ucx tag receive");
+  result.tag = info.sender_tag;
+  result.length = info.length;
+  return true;
+}
+
+void UcxStreamLane::progress() { ucp_worker_progress(worker_); }
 
 void UcxStreamLane::recv_all(void *data, size_t length) {
   char *cursor = static_cast<char *>(data);

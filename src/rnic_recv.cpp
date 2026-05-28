@@ -24,6 +24,8 @@ struct Options {
   std::vector<LaneSpec> lanes;
   std::string results_json;
   bool sink = false;
+  uint32_t depth = 16;
+  std::string verify = "chunk";
 };
 
 struct SharedState {
@@ -39,7 +41,8 @@ struct SharedState {
 void usage(const char *argv0) {
   std::cerr
       << "Usage: " << argv0 << " --output FILE --lane " << lane_spec_help(false)
-      << " [--lane ...] [--results-json FILE] [--sink]\n\n"
+      << " [--lane ...] [--results-json FILE] [--sink]"
+      << " [--depth N] [--verify none|chunk|file|both]\n\n"
       << "Examples:\n"
       << "  " << argv0
       << " --output model.bin --lane nic,10.102.0.239,5001,tcp,ens11\n"
@@ -66,6 +69,10 @@ Options parse_args(int argc, char **argv) {
       opt.results_json = require_value(arg);
     } else if (arg == "--sink") {
       opt.sink = true;
+    } else if (arg == "--depth") {
+      opt.depth = static_cast<uint32_t>(std::stoul(require_value(arg)));
+    } else if (arg == "--verify") {
+      opt.verify = require_value(arg);
     } else if (arg == "--help" || arg == "-h") {
       usage(argv[0]);
       std::exit(0);
@@ -78,6 +85,13 @@ Options parse_args(int argc, char **argv) {
   }
   if (opt.lanes.empty()) {
     throw std::runtime_error("at least one --lane is required");
+  }
+  if (opt.depth == 0) {
+    throw std::runtime_error("--depth must be greater than zero");
+  }
+  if (opt.verify != "none" && opt.verify != "chunk" && opt.verify != "file" &&
+      opt.verify != "both") {
+    throw std::runtime_error("--verify must be none, chunk, file, or both");
   }
   return opt;
 }
@@ -125,7 +139,8 @@ void apply_meta(SharedState &state, const FrameHeader &header, bool sink) {
 
 void write_json(const std::string &path, const TransferMeta &meta,
                 const std::vector<LaneStats> &stats, double total_seconds,
-                const std::string &actual_sha, bool ok, bool sink) {
+                const std::string &actual_sha, bool ok, bool sink, uint32_t depth,
+                const std::string &verify) {
   if (path.empty()) {
     return;
   }
@@ -145,6 +160,8 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"actual_sha256\": \"%s\",\n"
                "  \"sha256_ok\": %s,\n"
                "  \"sink\": %s,\n"
+               "  \"depth\": %u,\n"
+               "  \"verify\": \"%s\",\n"
                "  \"total_seconds\": %.6f,\n"
                "  \"throughput_mib_s\": %.3f,\n"
                "  \"lanes\": [\n",
@@ -152,7 +169,8 @@ void write_json(const std::string &path, const TransferMeta &meta,
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), actual_sha.c_str(), ok ? "true" : "false",
-               sink ? "true" : "false", total_seconds,
+               sink ? "true" : "false", depth, json_escape(verify).c_str(),
+               total_seconds,
                (meta.file_size / 1048576.0) / total_seconds);
   for (size_t i = 0; i < stats.size(); ++i) {
     const auto &s = stats[i];
@@ -168,6 +186,60 @@ void write_json(const std::string &path, const TransferMeta &meta,
   std::fclose(fp);
 }
 
+struct RecvSlot {
+  std::vector<uint8_t> buffer;
+  void *request = nullptr;
+};
+
+bool process_slot(RecvSlot &slot, const UcxRecvResult &result, SharedState &state,
+                  LaneStats &stats, bool sink, bool chunk_verify) {
+  if (result.length < sizeof(FrameHeader)) {
+    throw std::runtime_error("received tag frame smaller than header");
+  }
+  const auto *header = reinterpret_cast<const FrameHeader *>(slot.buffer.data());
+  validate_frame_header(*header);
+  if (static_cast<FrameType>(header->type) != FrameType::Data) {
+    throw std::runtime_error("received non-data tag frame");
+  }
+  if (result.tag != static_cast<ucp_tag_t>(header->chunk_id + 1)) {
+    throw std::runtime_error("tag does not match chunk id");
+  }
+  if (result.length != sizeof(FrameHeader) + header->length) {
+    throw std::runtime_error("tag frame length does not match header length");
+  }
+  if (header->length > state.meta.chunk_size) {
+    throw std::runtime_error("received chunk larger than configured chunk size");
+  }
+  if (header->offset + header->length > state.meta.file_size) {
+    throw std::runtime_error("received chunk outside file bounds");
+  }
+
+  const uint8_t *payload = slot.buffer.data() + sizeof(FrameHeader);
+  if (chunk_verify && fnv1a64(payload, header->length) != header->checksum) {
+    throw std::runtime_error("chunk checksum mismatch at chunk " +
+                             std::to_string(header->chunk_id));
+  }
+  if (!sink) {
+    ssize_t n = pwrite(state.fd, payload, header->length,
+                       static_cast<off_t>(header->offset));
+    if (n != static_cast<ssize_t>(header->length)) {
+      throw std::runtime_error("pwrite failed for chunk " +
+                               std::to_string(header->chunk_id));
+    }
+  }
+  state.received_chunks += 1;
+  state.received_bytes += header->length;
+  stats.chunks += 1;
+  stats.bytes += header->length;
+  return true;
+}
+
+bool post_recv(UcxStreamLane &lane, RecvSlot &slot, size_t frame_size,
+               UcxRecvResult &immediate) {
+  slot.request = lane.post_tag_recv(slot.buffer.data(), frame_size, 0, 0, &immediate);
+  return slot.request == nullptr;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -175,6 +247,8 @@ int main(int argc, char **argv) {
     const Options opt = parse_args(argc, argv);
     SharedState state;
     state.output = opt.output;
+    const bool chunk_verify = opt.verify == "chunk" || opt.verify == "both";
+    const bool file_verify = opt.verify == "file" || opt.verify == "both";
     std::vector<LaneStats> stats(opt.lanes.size());
     std::atomic<bool> failed{false};
     std::vector<std::string> errors(opt.lanes.size());
@@ -191,44 +265,60 @@ int main(int argc, char **argv) {
           FrameHeader meta_frame{};
           lane.recv_all(&meta_frame, sizeof(meta_frame));
           apply_meta(state, meta_frame, opt.sink);
+          const uint64_t lane_expected_chunks = meta_frame.checksum;
 
-          std::vector<uint8_t> buffer(state.meta.chunk_size);
+          std::vector<RecvSlot> slots(opt.depth);
+          const size_t frame_size = sizeof(FrameHeader) + state.meta.chunk_size;
+          for (auto &slot : slots) {
+            slot.buffer.resize(frame_size);
+          }
           const auto lane_start = std::chrono::steady_clock::now();
-          while (true) {
-            FrameHeader header{};
-            lane.recv_all(&header, sizeof(header));
-            validate_frame_header(header);
-            const auto type = static_cast<FrameType>(header.type);
-            if (type == FrameType::Done) {
-              break;
+          uint64_t posted = 0;
+          uint64_t completed = 0;
+          for (auto &slot : slots) {
+            if (posted < lane_expected_chunks) {
+              UcxRecvResult immediate{};
+              if (post_recv(lane, slot, frame_size, immediate)) {
+                process_slot(slot, immediate, state, stats[i], opt.sink, chunk_verify);
+                ++completed;
+              }
+              ++posted;
             }
-            if (type != FrameType::Data) {
-              throw std::runtime_error("unexpected frame type on data stream");
-            }
-            if (header.length > state.meta.chunk_size) {
-              throw std::runtime_error("received chunk larger than configured chunk size");
-            }
-            if (header.offset + header.length > state.meta.file_size) {
-              throw std::runtime_error("received chunk outside file bounds");
-            }
-            lane.recv_all(buffer.data(), header.length);
-            const uint64_t checksum = fnv1a64(buffer.data(), header.length);
-            if (checksum != header.checksum) {
-              throw std::runtime_error("chunk checksum mismatch at chunk " +
-                                       std::to_string(header.chunk_id));
-            }
-            if (!opt.sink) {
-              ssize_t n = pwrite(state.fd, buffer.data(), header.length,
-                                 static_cast<off_t>(header.offset));
-              if (n != static_cast<ssize_t>(header.length)) {
-                throw std::runtime_error("pwrite failed for chunk " +
-                                         std::to_string(header.chunk_id));
+          }
+
+          while (completed < lane_expected_chunks) {
+            bool made_progress = false;
+            for (auto &slot : slots) {
+              if (slot.request == nullptr) {
+                continue;
+              }
+              UcxRecvResult result{};
+              if (lane.test_recv(slot.request, result)) {
+                slot.request = nullptr;
+                process_slot(slot, result, state, stats[i], opt.sink, chunk_verify);
+                ++completed;
+                made_progress = true;
+                if (posted < lane_expected_chunks) {
+                  UcxRecvResult immediate{};
+                  if (post_recv(lane, slot, frame_size, immediate)) {
+                    process_slot(slot, immediate, state, stats[i], opt.sink,
+                                 chunk_verify);
+                    ++completed;
+                  }
+                  ++posted;
+                }
               }
             }
-            state.received_chunks += 1;
-            state.received_bytes += header.length;
-            stats[i].chunks += 1;
-            stats[i].bytes += header.length;
+            if (!made_progress) {
+              lane.progress();
+            }
+          }
+
+          FrameHeader done{};
+          lane.recv_all(&done, sizeof(done));
+          validate_frame_header(done);
+          if (static_cast<FrameType>(done.type) != FrameType::Done) {
+            throw std::runtime_error("expected done frame after tag data");
           }
           const auto lane_end = std::chrono::steady_clock::now();
           stats[i].seconds =
@@ -266,10 +356,10 @@ int main(int argc, char **argv) {
     const auto total_end = std::chrono::steady_clock::now();
     const double total_seconds =
         std::chrono::duration<double>(total_end - total_start).count();
-    const std::string actual_sha = opt.sink ? "" : sha256_file_hex(opt.output);
-    const bool ok = opt.sink || actual_sha == state.meta.sha256_hex;
+    const std::string actual_sha = (!opt.sink && file_verify) ? sha256_file_hex(opt.output) : "";
+    const bool ok = opt.sink || !file_verify || actual_sha == state.meta.sha256_hex;
     write_json(opt.results_json, state.meta, stats, total_seconds, actual_sha, ok,
-               opt.sink);
+               opt.sink, opt.depth, opt.verify);
     if (!ok) {
       throw std::runtime_error("final SHA256 mismatch");
     }

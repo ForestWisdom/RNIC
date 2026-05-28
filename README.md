@@ -37,20 +37,23 @@ or on either server:
 Start the receiver on `Cambricon-1` first:
 
 ```bash
-MODE=hybrid OUT_FILE=~/zhangzhisen/rnic_received.bin ./scripts/run_receiver.sh
+MODE=hybrid DEPTH=16 VERIFY=chunk OUT_FILE=~/zhangzhisen/rnic_received.bin ./scripts/run_receiver.sh
 ```
 
 Use `SINK=1` on the receiver to measure receive/network overhead without
 writing the reconstructed file to disk:
 
 ```bash
-SINK=1 MODE=rdma-only ./scripts/run_receiver.sh
+SINK=1 MODE=rdma-only DEPTH=32 VERIFY=none ./scripts/run_receiver.sh
 ```
+
+`DEPTH` controls the per-lane in-flight chunk window. Increase it to keep the
+RNIC busy, for example `DEPTH=8`, `16`, `32`, or `64`.
 
 Then start the sender on `4090-2`:
 
 ```bash
-MODE=hybrid IN_FILE=/path/to/model-weight.bin ./scripts/run_sender.sh
+MODE=hybrid DEPTH=16 VERIFY=chunk IN_FILE=/path/to/model-weight.bin ./scripts/run_sender.sh
 ```
 
 Supported modes:
@@ -60,7 +63,7 @@ Supported modes:
   POSIX TCP control socket only to exchange UCP worker addresses; the UCX lane
   itself uses `rc_mlx5` over `mlx5_0:1`, with `ud_mlx5` as the RDMA auxiliary
   wireup transport required by this UCX build.
-- `hybrid`: UCX TCP + RDMA lanes, with static 30/70 chunk weighting.
+- `hybrid`: UCX TCP + RDMA lanes, with static 15/85 chunk weighting.
 
 Run all three modes from `4090-2` after both servers have the repository:
 

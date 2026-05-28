@@ -10,6 +10,11 @@
 
 namespace rnic {
 
+struct UcxRecvResult {
+  ucp_tag_t tag = 0;
+  size_t length = 0;
+};
+
 class UcxStreamLane {
 public:
   UcxStreamLane(LaneSpec spec, bool server);
@@ -21,6 +26,12 @@ public:
   void connect();
   void send_all(const void *data, size_t length);
   void recv_all(void *data, size_t length);
+  void *post_tag_send(const void *data, size_t length, ucp_tag_t tag);
+  void *post_tag_recv(void *data, size_t length, ucp_tag_t tag,
+                      ucp_tag_t tag_mask, UcxRecvResult *immediate);
+  bool test_send(void *request);
+  bool test_recv(void *request, UcxRecvResult &result);
+  void progress();
   const LaneSpec &spec() const { return spec_; }
 
 private:

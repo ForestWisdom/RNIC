@@ -6,6 +6,8 @@ IN_FILE="${IN_FILE:?set IN_FILE to the model weight or test file on 4090-2}"
 RESULT_DIR="${RESULT_DIR:-$ROOT_DIR/results}"
 MODE="${MODE:-hybrid}"
 CHUNK_SIZE="${CHUNK_SIZE:-16777216}"
+DEPTH="${DEPTH:-16}"
+VERIFY="${VERIFY:-chunk}"
 
 mkdir -p "$RESULT_DIR"
 cd "$ROOT_DIR"
@@ -16,6 +18,8 @@ case "$MODE" in
       --input "$IN_FILE" \
       --mode "$MODE" \
       --chunk-size "$CHUNK_SIZE" \
+      --depth "$DEPTH" \
+      --verify "$VERIFY" \
       --lane "nic,10.102.0.239,5001,tcp,eno1np0,1" \
       --results-json "$RESULT_DIR/send-nic-only.json"
     ;;
@@ -24,6 +28,8 @@ case "$MODE" in
       --input "$IN_FILE" \
       --mode "$MODE" \
       --chunk-size "$CHUNK_SIZE" \
+      --depth "$DEPTH" \
+      --verify "$VERIFY" \
       --lane "rdma,192.168.2.248,5002,rc_mlx5+ud_mlx5,mlx5_0:1,1" \
       --results-json "$RESULT_DIR/send-rdma-only.json"
     ;;
@@ -32,8 +38,10 @@ case "$MODE" in
       --input "$IN_FILE" \
       --mode "$MODE" \
       --chunk-size "$CHUNK_SIZE" \
-      --lane "nic,10.102.0.239,5001,tcp,eno1np0,30" \
-      --lane "rdma,192.168.2.248,5002,rc_mlx5+ud_mlx5,mlx5_0:1,70" \
+      --depth "$DEPTH" \
+      --verify "$VERIFY" \
+      --lane "nic,10.102.0.239,5001,tcp,eno1np0,15" \
+      --lane "rdma,192.168.2.248,5002,rc_mlx5+ud_mlx5,mlx5_0:1,85" \
       --results-json "$RESULT_DIR/send-hybrid.json"
     ;;
   *)
