@@ -24,7 +24,7 @@ case "$MODE" in
       --input "$IN_FILE" \
       --mode "$MODE" \
       --chunk-size "$CHUNK_SIZE" \
-      --lane "rdma,192.168.2.248,5002,rc_mlx5+tcp,-,1" \
+      --lane "rdma,192.168.2.248,5002,rc_mlx5,mlx5_0:1,1" \
       --results-json "$RESULT_DIR/send-rdma-only.json"
     ;;
   hybrid)
@@ -33,7 +33,7 @@ case "$MODE" in
       --mode "$MODE" \
       --chunk-size "$CHUNK_SIZE" \
       --lane "nic,10.102.0.239,5001,tcp,eno1np0,30" \
-      --lane "rdma,192.168.2.248,5002,rc_mlx5+tcp,-,70" \
+      --lane "rdma,192.168.2.248,5002,rc_mlx5,mlx5_0:1,70" \
       --results-json "$RESULT_DIR/send-hybrid.json"
     ;;
   *)

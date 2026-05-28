@@ -25,19 +25,18 @@ public:
 
 private:
   void init_ucx();
-  void server_listen();
-  void client_connect();
+  void server_connect_oob();
+  void client_connect_oob();
   void wait_request(void *request);
   void close_endpoint();
+  void create_endpoint_from_peer_address(const void *address, size_t length);
 
   LaneSpec spec_;
   bool server_ = false;
   ucp_config_t *config_ = nullptr;
   ucp_context_h context_ = nullptr;
   ucp_worker_h worker_ = nullptr;
-  ucp_listener_h listener_ = nullptr;
   ucp_ep_h ep_ = nullptr;
-  ucp_conn_request_h conn_request_ = nullptr;
 };
 
 } // namespace rnic

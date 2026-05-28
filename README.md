@@ -49,9 +49,9 @@ MODE=hybrid IN_FILE=/path/to/model-weight.bin ./scripts/run_sender.sh
 Supported modes:
 
 - `nic-only`: UCX TCP lane on the ordinary NIC path.
-- `rdma-only`: UCX RDMA lane on the RNIC path. The scripts use
-  `rc_mlx5+tcp`, which is translated to UCX `rc_mlx5,tcp`; TCP is needed by
-  this UCX build as the sockaddr connection manager.
+- `rdma-only`: UCX RDMA lane on the RNIC path. The prototype uses a small
+  POSIX TCP control socket only to exchange UCP worker addresses; the UCX lane
+  itself can use `rc_mlx5` over `mlx5_0:1`.
 - `hybrid`: UCX TCP + RDMA lanes, with static 30/70 chunk weighting.
 
 Run all three modes from `4090-2` after both servers have the repository:

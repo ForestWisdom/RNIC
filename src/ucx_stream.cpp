@@ -1,6 +1,9 @@
 #include "rnic/ucx_stream.hpp"
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <ucs/type/status.h>
 
 #include <chrono>
@@ -30,6 +33,42 @@ sockaddr_in make_sockaddr(const std::string &host, uint16_t port) {
   return addr;
 }
 
+void socket_send_all(int fd, const void *data, size_t length) {
+  const char *cursor = static_cast<const char *>(data);
+  while (length > 0) {
+    const ssize_t n = ::send(fd, cursor, length, 0);
+    if (n <= 0) {
+      throw std::runtime_error("socket send failed during UCX address exchange");
+    }
+    cursor += n;
+    length -= static_cast<size_t>(n);
+  }
+}
+
+void socket_recv_all(int fd, void *data, size_t length) {
+  char *cursor = static_cast<char *>(data);
+  while (length > 0) {
+    const ssize_t n = ::recv(fd, cursor, length, MSG_WAITALL);
+    if (n <= 0) {
+      throw std::runtime_error("socket recv failed during UCX address exchange");
+    }
+    cursor += n;
+    length -= static_cast<size_t>(n);
+  }
+}
+
+uint64_t host_to_be64(uint64_t value) {
+  const uint32_t high = htonl(static_cast<uint32_t>(value >> 32));
+  const uint32_t low = htonl(static_cast<uint32_t>(value & 0xffffffffu));
+  return (static_cast<uint64_t>(low) << 32) | high;
+}
+
+uint64_t be64_to_host(uint64_t value) {
+  const uint32_t high = ntohl(static_cast<uint32_t>(value >> 32));
+  const uint32_t low = ntohl(static_cast<uint32_t>(value & 0xffffffffu));
+  return (static_cast<uint64_t>(low) << 32) | high;
+}
+
 } // namespace
 
 UcxStreamLane::UcxStreamLane(LaneSpec spec, bool server)
@@ -38,9 +77,6 @@ UcxStreamLane::UcxStreamLane(LaneSpec spec, bool server)
 UcxStreamLane::~UcxStreamLane() {
   if (ep_ != nullptr) {
     close_endpoint();
-  }
-  if (listener_ != nullptr) {
-    ucp_listener_destroy(listener_);
   }
   if (worker_ != nullptr) {
     ucp_worker_destroy(worker_);
@@ -91,55 +127,94 @@ void UcxStreamLane::init_ucx() {
 void UcxStreamLane::connect() {
   init_ucx();
   if (server_) {
-    server_listen();
+    server_connect_oob();
   } else {
-    client_connect();
+    client_connect_oob();
   }
 }
 
-void UcxStreamLane::server_listen() {
-  struct HandlerState {
-    ucp_conn_request_h request = nullptr;
-  } state;
-
-  auto cb = [](ucp_conn_request_h conn_request, void *arg) {
-    auto *handler_state = static_cast<HandlerState *>(arg);
-    if (handler_state->request == nullptr) {
-      handler_state->request = conn_request;
-    }
-  };
-
-  const sockaddr_in addr = make_sockaddr(spec_.host, spec_.port);
-  ucp_listener_params_t params{};
-  params.field_mask = UCP_LISTENER_PARAM_FIELD_SOCK_ADDR |
-                      UCP_LISTENER_PARAM_FIELD_CONN_HANDLER;
-  params.sockaddr.addr = reinterpret_cast<const sockaddr *>(&addr);
-  params.sockaddr.addrlen = sizeof(addr);
-  params.conn_handler.cb = cb;
-  params.conn_handler.arg = &state;
-
-  check_status(ucp_listener_create(worker_, &params, &listener_),
-               "ucp_listener_create");
-  while (state.request == nullptr) {
-    ucp_worker_progress(worker_);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  conn_request_ = state.request;
-
+void UcxStreamLane::create_endpoint_from_peer_address(const void *address,
+                                                      size_t length) {
   ucp_ep_params_t ep_params{};
-  ep_params.field_mask = UCP_EP_PARAM_FIELD_CONN_REQUEST;
-  ep_params.conn_request = conn_request_;
-  check_status(ucp_ep_create(worker_, &ep_params, &ep_), "ucp_ep_create server");
+  ep_params.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS;
+  ep_params.address = static_cast<const ucp_address_t *>(address);
+  (void)length;
+  check_status(ucp_ep_create(worker_, &ep_params, &ep_), "ucp_ep_create address");
 }
 
-void UcxStreamLane::client_connect() {
+void UcxStreamLane::server_connect_oob() {
+  ucp_address_t *local_address = nullptr;
+  size_t local_length = 0;
+  check_status(ucp_worker_get_address(worker_, &local_address, &local_length),
+               "ucp_worker_get_address");
+
   const sockaddr_in addr = make_sockaddr(spec_.host, spec_.port);
-  ucp_ep_params_t ep_params{};
-  ep_params.field_mask = UCP_EP_PARAM_FIELD_SOCK_ADDR | UCP_EP_PARAM_FIELD_FLAGS;
-  ep_params.flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
-  ep_params.sockaddr.addr = reinterpret_cast<const sockaddr *>(&addr);
-  ep_params.sockaddr.addrlen = sizeof(addr);
-  check_status(ucp_ep_create(worker_, &ep_params, &ep_), "ucp_ep_create client");
+  const int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0) {
+    ucp_worker_release_address(worker_, local_address);
+    throw std::runtime_error("failed to create OOB listen socket");
+  }
+  const int one = 1;
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (::bind(listen_fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0 ||
+      ::listen(listen_fd, 1) != 0) {
+    ::close(listen_fd);
+    ucp_worker_release_address(worker_, local_address);
+    throw std::runtime_error("failed to bind/listen OOB socket on " + spec_.host +
+                             ":" + std::to_string(spec_.port));
+  }
+
+  const int fd = ::accept(listen_fd, nullptr, nullptr);
+  ::close(listen_fd);
+  if (fd < 0) {
+    ucp_worker_release_address(worker_, local_address);
+    throw std::runtime_error("failed to accept OOB connection");
+  }
+
+  uint64_t peer_length_be = 0;
+  socket_recv_all(fd, &peer_length_be, sizeof(peer_length_be));
+  const uint64_t peer_length = be64_to_host(peer_length_be);
+  std::string peer_address(peer_length, '\0');
+  socket_recv_all(fd, peer_address.data(), peer_address.size());
+
+  const uint64_t local_length_be = host_to_be64(local_length);
+  socket_send_all(fd, &local_length_be, sizeof(local_length_be));
+  socket_send_all(fd, local_address, local_length);
+  ::close(fd);
+
+  ucp_worker_release_address(worker_, local_address);
+  create_endpoint_from_peer_address(peer_address.data(), peer_address.size());
+}
+
+void UcxStreamLane::client_connect_oob() {
+  ucp_address_t *local_address = nullptr;
+  size_t local_length = 0;
+  check_status(ucp_worker_get_address(worker_, &local_address, &local_length),
+               "ucp_worker_get_address");
+
+  const sockaddr_in addr = make_sockaddr(spec_.host, spec_.port);
+  const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    ucp_worker_release_address(worker_, local_address);
+    throw std::runtime_error("failed to create OOB client socket");
+  }
+  while (::connect(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  const uint64_t local_length_be = host_to_be64(local_length);
+  socket_send_all(fd, &local_length_be, sizeof(local_length_be));
+  socket_send_all(fd, local_address, local_length);
+
+  uint64_t peer_length_be = 0;
+  socket_recv_all(fd, &peer_length_be, sizeof(peer_length_be));
+  const uint64_t peer_length = be64_to_host(peer_length_be);
+  std::string peer_address(peer_length, '\0');
+  socket_recv_all(fd, peer_address.data(), peer_address.size());
+  ::close(fd);
+
+  ucp_worker_release_address(worker_, local_address);
+  create_endpoint_from_peer_address(peer_address.data(), peer_address.size());
 }
 
 void UcxStreamLane::wait_request(void *request) {
