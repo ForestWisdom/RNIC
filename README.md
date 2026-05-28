@@ -40,6 +40,13 @@ Start the receiver on `Cambricon-1` first:
 MODE=hybrid OUT_FILE=~/zhangzhisen/rnic_received.bin ./scripts/run_receiver.sh
 ```
 
+Use `SINK=1` on the receiver to measure receive/network overhead without
+writing the reconstructed file to disk:
+
+```bash
+SINK=1 MODE=rdma-only ./scripts/run_receiver.sh
+```
+
 Then start the sender on `4090-2`:
 
 ```bash

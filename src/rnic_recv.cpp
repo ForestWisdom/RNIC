@@ -23,6 +23,7 @@ struct Options {
   std::string output;
   std::vector<LaneSpec> lanes;
   std::string results_json;
+  bool sink = false;
 };
 
 struct SharedState {
@@ -38,7 +39,7 @@ struct SharedState {
 void usage(const char *argv0) {
   std::cerr
       << "Usage: " << argv0 << " --output FILE --lane " << lane_spec_help(false)
-      << " [--lane ...] [--results-json FILE]\n\n"
+      << " [--lane ...] [--results-json FILE] [--sink]\n\n"
       << "Examples:\n"
       << "  " << argv0
       << " --output model.bin --lane nic,10.102.0.239,5001,tcp,ens11\n"
@@ -63,6 +64,8 @@ Options parse_args(int argc, char **argv) {
       opt.lanes.push_back(parse_lane_spec(require_value(arg), false));
     } else if (arg == "--results-json") {
       opt.results_json = require_value(arg);
+    } else if (arg == "--sink") {
+      opt.sink = true;
     } else if (arg == "--help" || arg == "-h") {
       usage(argv[0]);
       std::exit(0);
@@ -70,7 +73,7 @@ Options parse_args(int argc, char **argv) {
       throw std::runtime_error("unknown argument: " + arg);
     }
   }
-  if (opt.output.empty()) {
+  if (opt.output.empty() && !opt.sink) {
     throw std::runtime_error("--output is required");
   }
   if (opt.lanes.empty()) {
@@ -89,7 +92,7 @@ TransferMeta meta_from_header(const FrameHeader &header) {
   return meta;
 }
 
-void apply_meta(SharedState &state, const FrameHeader &header) {
+void apply_meta(SharedState &state, const FrameHeader &header, bool sink) {
   validate_frame_header(header);
   if (header.type != static_cast<uint16_t>(FrameType::Meta)) {
     throw std::runtime_error("first frame on each lane must be metadata");
@@ -98,12 +101,14 @@ void apply_meta(SharedState &state, const FrameHeader &header) {
   const TransferMeta incoming = meta_from_header(header);
   if (!state.meta_ready) {
     state.meta = incoming;
-    state.fd = open(state.output.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (state.fd < 0) {
-      throw std::runtime_error("failed to open output file: " + state.output);
-    }
-    if (ftruncate(state.fd, static_cast<off_t>(state.meta.file_size)) != 0) {
-      throw std::runtime_error("failed to preallocate output file");
+    if (!sink) {
+      state.fd = open(state.output.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+      if (state.fd < 0) {
+        throw std::runtime_error("failed to open output file: " + state.output);
+      }
+      if (ftruncate(state.fd, static_cast<off_t>(state.meta.file_size)) != 0) {
+        throw std::runtime_error("failed to preallocate output file");
+      }
     }
     state.meta_ready = true;
     return;
@@ -120,7 +125,7 @@ void apply_meta(SharedState &state, const FrameHeader &header) {
 
 void write_json(const std::string &path, const TransferMeta &meta,
                 const std::vector<LaneStats> &stats, double total_seconds,
-                const std::string &actual_sha, bool ok) {
+                const std::string &actual_sha, bool ok, bool sink) {
   if (path.empty()) {
     return;
   }
@@ -139,6 +144,7 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"expected_sha256\": \"%s\",\n"
                "  \"actual_sha256\": \"%s\",\n"
                "  \"sha256_ok\": %s,\n"
+               "  \"sink\": %s,\n"
                "  \"total_seconds\": %.6f,\n"
                "  \"throughput_mib_s\": %.3f,\n"
                "  \"lanes\": [\n",
@@ -146,7 +152,8 @@ void write_json(const std::string &path, const TransferMeta &meta,
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), actual_sha.c_str(), ok ? "true" : "false",
-               total_seconds, (meta.file_size / 1048576.0) / total_seconds);
+               sink ? "true" : "false", total_seconds,
+               (meta.file_size / 1048576.0) / total_seconds);
   for (size_t i = 0; i < stats.size(); ++i) {
     const auto &s = stats[i];
     std::fprintf(fp,
@@ -183,7 +190,7 @@ int main(int argc, char **argv) {
 
           FrameHeader meta_frame{};
           lane.recv_all(&meta_frame, sizeof(meta_frame));
-          apply_meta(state, meta_frame);
+          apply_meta(state, meta_frame, opt.sink);
 
           std::vector<uint8_t> buffer(state.meta.chunk_size);
           const auto lane_start = std::chrono::steady_clock::now();
@@ -210,11 +217,13 @@ int main(int argc, char **argv) {
               throw std::runtime_error("chunk checksum mismatch at chunk " +
                                        std::to_string(header.chunk_id));
             }
-            ssize_t n = pwrite(state.fd, buffer.data(), header.length,
-                               static_cast<off_t>(header.offset));
-            if (n != static_cast<ssize_t>(header.length)) {
-              throw std::runtime_error("pwrite failed for chunk " +
-                                       std::to_string(header.chunk_id));
+            if (!opt.sink) {
+              ssize_t n = pwrite(state.fd, buffer.data(), header.length,
+                                 static_cast<off_t>(header.offset));
+              if (n != static_cast<ssize_t>(header.length)) {
+                throw std::runtime_error("pwrite failed for chunk " +
+                                         std::to_string(header.chunk_id));
+              }
             }
             state.received_chunks += 1;
             state.received_bytes += header.length;
@@ -257,9 +266,10 @@ int main(int argc, char **argv) {
     const auto total_end = std::chrono::steady_clock::now();
     const double total_seconds =
         std::chrono::duration<double>(total_end - total_start).count();
-    const std::string actual_sha = sha256_file_hex(opt.output);
-    const bool ok = actual_sha == state.meta.sha256_hex;
-    write_json(opt.results_json, state.meta, stats, total_seconds, actual_sha, ok);
+    const std::string actual_sha = opt.sink ? "" : sha256_file_hex(opt.output);
+    const bool ok = opt.sink || actual_sha == state.meta.sha256_hex;
+    write_json(opt.results_json, state.meta, stats, total_seconds, actual_sha, ok,
+               opt.sink);
     if (!ok) {
       throw std::runtime_error("final SHA256 mismatch");
     }
@@ -268,7 +278,7 @@ int main(int argc, char **argv) {
               << " chunks=" << state.meta.total_chunks
               << " seconds=" << total_seconds
               << " throughput_mib_s=" << (state.meta.file_size / 1048576.0) / total_seconds
-              << " sha256_ok=true\n";
+              << " sha256_ok=" << (opt.sink ? "skipped_sink" : "true") << "\n";
     for (const auto &s : stats) {
       std::cout << "lane=" << s.name << " chunks=" << s.chunks
                 << " bytes=" << s.bytes << " seconds=" << s.seconds << "\n";
