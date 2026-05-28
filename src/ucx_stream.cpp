@@ -37,8 +37,7 @@ UcxStreamLane::UcxStreamLane(LaneSpec spec, bool server)
 
 UcxStreamLane::~UcxStreamLane() {
   if (ep_ != nullptr) {
-    ucp_ep_close_nbx(ep_, nullptr);
-    ep_ = nullptr;
+    close_endpoint();
   }
   if (listener_ != nullptr) {
     ucp_listener_destroy(listener_);
@@ -52,6 +51,18 @@ UcxStreamLane::~UcxStreamLane() {
   if (config_ != nullptr) {
     ucp_config_release(config_);
   }
+}
+
+void UcxStreamLane::close_endpoint() {
+  ucp_request_param_t params{};
+  ucs_status_ptr_t request = ucp_ep_close_nbx(ep_, &params);
+  if (!UCS_PTR_IS_ERR(request) && request != nullptr) {
+    while (ucp_request_check_status(request) == UCS_INPROGRESS) {
+      ucp_worker_progress(worker_);
+    }
+    ucp_request_free(request);
+  }
+  ep_ = nullptr;
 }
 
 void UcxStreamLane::init_ucx() {

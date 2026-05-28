@@ -28,6 +28,7 @@ private:
   void server_listen();
   void client_connect();
   void wait_request(void *request);
+  void close_endpoint();
 
   LaneSpec spec_;
   bool server_ = false;
