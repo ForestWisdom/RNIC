@@ -124,7 +124,8 @@ void UcxStreamLane::server_listen() {
 void UcxStreamLane::client_connect() {
   const sockaddr_in addr = make_sockaddr(spec_.host, spec_.port);
   ucp_ep_params_t ep_params{};
-  ep_params.field_mask = UCP_EP_PARAM_FIELD_SOCK_ADDR;
+  ep_params.field_mask = UCP_EP_PARAM_FIELD_SOCK_ADDR | UCP_EP_PARAM_FIELD_FLAGS;
+  ep_params.flags = UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
   ep_params.sockaddr.addr = reinterpret_cast<const sockaddr *>(&addr);
   ep_params.sockaddr.addrlen = sizeof(addr);
   check_status(ucp_ep_create(worker_, &ep_params, &ep_), "ucp_ep_create client");
