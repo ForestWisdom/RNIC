@@ -51,7 +51,8 @@ Supported modes:
 - `nic-only`: UCX TCP lane on the ordinary NIC path.
 - `rdma-only`: UCX RDMA lane on the RNIC path. The prototype uses a small
   POSIX TCP control socket only to exchange UCP worker addresses; the UCX lane
-  itself can use `rc_mlx5` over `mlx5_0:1`.
+  itself uses `rc_mlx5` over `mlx5_0:1`, with `ud_mlx5` as the RDMA auxiliary
+  wireup transport required by this UCX build.
 - `hybrid`: UCX TCP + RDMA lanes, with static 30/70 chunk weighting.
 
 Run all three modes from `4090-2` after both servers have the repository:
