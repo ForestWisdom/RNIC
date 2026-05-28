@@ -54,6 +54,7 @@ LaneSpec parse_lane_spec(const std::string &spec, bool require_host) {
   if (lane.name.empty() || lane.port == 0 || lane.tls.empty()) {
     throw std::runtime_error("lane name, port, and tls must be non-empty");
   }
+  std::replace(lane.tls.begin(), lane.tls.end(), '+', ',');
   if (lane.weight == 0) {
     throw std::runtime_error("lane weight must be greater than zero");
   }

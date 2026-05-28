@@ -19,14 +19,14 @@ case "$MODE" in
   rdma-only)
     exec ./build/rnic_recv \
       --output "$OUT_FILE" \
-      --lane "rdma,192.168.2.248,5002,rc_x,mlx5_0:1" \
+      --lane "rdma,192.168.2.248,5002,rc_mlx5+tcp,-" \
       --results-json "$RESULT_DIR/recv-rdma-only.json"
     ;;
   hybrid)
     exec ./build/rnic_recv \
       --output "$OUT_FILE" \
       --lane "nic,10.102.0.239,5001,tcp,ens11" \
-      --lane "rdma,192.168.2.248,5002,rc_x,mlx5_0:1" \
+      --lane "rdma,192.168.2.248,5002,rc_mlx5+tcp,-" \
       --results-json "$RESULT_DIR/recv-hybrid.json"
     ;;
   *)
