@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-$HOME/zhangzhisen/RNIC}"
+SENDER_HOST="${SENDER_HOST:-}"
+DEFAULT_WORK_ROOT="$HOME/zhangzhisen"
+if [ -n "$SENDER_HOST" ]; then
+  DEFAULT_WORK_ROOT="/home/sdu/zhangzhisen"
+fi
+ROOT_DIR="${ROOT_DIR:-$DEFAULT_WORK_ROOT/RNIC}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RESULT_ROOT="${RESULT_ROOT:-$ROOT_DIR/results/$RUN_ID}"
 SIZE="${SIZE:-8589934592}"
@@ -10,8 +15,77 @@ DEPTH="${DEPTH:-16}"
 CPU_LIST="${CPU_LIST:-0-7}"
 REPEAT="${REPEAT:-1}"
 REMOTE="${REMOTE:-Cambricon-1}"
-OUT_PREFIX="${OUT_PREFIX:-$HOME/zhangzhisen/rnic_bench_recv}"
-TEST_FILE="${TEST_FILE:-$HOME/zhangzhisen/rnic_bench_64m.bin}"
+OUT_PREFIX="${OUT_PREFIX:-$DEFAULT_WORK_ROOT/rnic_bench_recv}"
+TEST_FILE="${TEST_FILE:-$DEFAULT_WORK_ROOT/rnic_bench_64m.bin}"
+
+if [ -n "$SENDER_HOST" ]; then
+  cleanup_control() {
+    ssh "$SENDER_HOST" "rm -f '$TEST_FILE'" >/dev/null 2>&1 || true
+    ssh "$REMOTE" "rm -f '${OUT_PREFIX}'*.bin '$TEST_FILE'" >/dev/null 2>&1 || true
+  }
+  trap cleanup_control EXIT
+
+  copy_receiver_result() {
+    local remote_path="$1"
+    local sender_path="$2"
+    local tmp
+    tmp="$(mktemp)"
+    scp "$REMOTE:$remote_path" "$tmp" >/dev/null
+    ssh "$SENDER_HOST" "mkdir -p '$(dirname "$sender_path")'"
+    scp "$tmp" "$SENDER_HOST:$sender_path" >/dev/null
+    rm -f "$tmp"
+  }
+
+  collect_env_pair_control() {
+    local case_dir="$1"
+    ssh "$SENDER_HOST" "mkdir -p '$case_dir' && cd '$ROOT_DIR' && MODE='${MODE:-}' RDMA_LANES='${RDMA_LANES:-}' DEPTH='${DEPTH:-}' ENGINE='${ENGINE:-}' REGISTER_BUFFERS='${REGISTER_BUFFERS:-}' CPU_LIST='${CPU_LIST:-}' VERIFY='${VERIFY:-}' SOURCE='${SOURCE:-}' SINK='${SINK:-}' ./scripts/collect_env.sh '$case_dir/env-sender.json'"
+    ssh "$REMOTE" "mkdir -p '$case_dir' && cd '$ROOT_DIR' && MODE='${MODE:-}' RDMA_LANES='${RDMA_LANES:-}' DEPTH='${DEPTH:-}' ENGINE='${ENGINE:-}' REGISTER_BUFFERS='${REGISTER_BUFFERS:-}' CPU_LIST='${CPU_LIST:-}' VERIFY='${VERIFY:-}' SOURCE='${SOURCE:-}' SINK='${SINK:-}' ./scripts/collect_env.sh '$case_dir/env-receiver.json'"
+    copy_receiver_result "$case_dir/env-receiver.json" "$case_dir/env-receiver.json"
+  }
+
+  run_case_control() {
+    local name="$1"
+    local engine="$2"
+    local register_buffers="$3"
+    local cpu_list="$4"
+    local repeat="$5"
+    local case_dir="$RESULT_ROOT/${name}-r${repeat}"
+
+    MODE=rdma-only RDMA_LANES="$RDMA_LANES" DEPTH="$DEPTH" ENGINE="$engine" \
+      REGISTER_BUFFERS="$register_buffers" CPU_LIST="$cpu_list" VERIFY=none SOURCE=zero SINK=1 \
+      collect_env_pair_control "$case_dir"
+
+    ssh "$REMOTE" "cd '$ROOT_DIR' && RESULT_DIR='$case_dir' SINK=1 MODE=rdma-only RDMA_LANES='$RDMA_LANES' DEPTH='$DEPTH' VERIFY=none ENGINE='$engine' REGISTER_BUFFERS='$register_buffers' CPU_LIST='$cpu_list' OUT_FILE='${OUT_PREFIX}-${name}-r${repeat}.bin' ./scripts/run_receiver.sh" &
+    local recv_pid=$!
+    sleep 2
+    ssh "$SENDER_HOST" "cd '$ROOT_DIR' && RESULT_DIR='$case_dir' MODE=rdma-only RDMA_LANES='$RDMA_LANES' DEPTH='$DEPTH' VERIFY=none SOURCE=zero SIZE='$SIZE' ENGINE='$engine' REGISTER_BUFFERS='$register_buffers' CPU_LIST='$cpu_list' ./scripts/run_sender.sh"
+    wait "$recv_pid"
+    copy_receiver_result "$case_dir/recv-rdma-only.json" "$case_dir/recv-rdma-only.json"
+  }
+
+  run_correctness_control() {
+    local case_dir="$RESULT_ROOT/correctness"
+    ssh "$SENDER_HOST" "mkdir -p '$case_dir' && dd if=/dev/zero of='$TEST_FILE' bs=1M count=64 status=none"
+    ssh "$REMOTE" "mkdir -p '$case_dir' '$DEFAULT_WORK_ROOT'"
+    ssh "$REMOTE" "cd '$ROOT_DIR' && RESULT_DIR='$case_dir' SINK=0 MODE=rdma-only RDMA_LANES=1 DEPTH=16 VERIFY=both ENGINE=tag REGISTER_BUFFERS=1 CPU_LIST=0 OUT_FILE='${OUT_PREFIX}-correctness.bin' ./scripts/run_receiver.sh" &
+    local recv_pid=$!
+    sleep 2
+    ssh "$SENDER_HOST" "cd '$ROOT_DIR' && RESULT_DIR='$case_dir' MODE=rdma-only RDMA_LANES=1 DEPTH=16 VERIFY=both SOURCE=file IN_FILE='$TEST_FILE' ENGINE=tag REGISTER_BUFFERS=1 CPU_LIST=0 ./scripts/run_sender.sh"
+    wait "$recv_pid"
+    copy_receiver_result "$case_dir/recv-rdma-only.json" "$case_dir/recv-rdma-only.json"
+  }
+
+  run_correctness_control
+  for r in $(seq 1 "$REPEAT"); do
+    run_case_control "tag-baseline" tag 0 "" "$r"
+    run_case_control "tag-memh" tag 1 "" "$r"
+    run_case_control "tag-memh-affinity" tag 1 "$CPU_LIST" "$r"
+    run_case_control "rma-memh-affinity" rma 1 "$CPU_LIST" "$r"
+  done
+  ssh "$SENDER_HOST" "cd '$ROOT_DIR' && ./scripts/summarize_results.py '$RESULT_ROOT'"
+  echo "results: $SENDER_HOST:$RESULT_ROOT"
+  exit 0
+fi
 
 mkdir -p "$RESULT_ROOT"
 cd "$ROOT_DIR"
