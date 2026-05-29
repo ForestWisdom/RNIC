@@ -146,14 +146,13 @@ void UcxStreamLane::unmap_memory(ucp_mem_h memh) {
 void *UcxStreamLane::pack_rkey(ucp_mem_h memh, size_t &length) {
   void *buffer = nullptr;
   length = 0;
-  ucp_memh_pack_params_t params{};
-  check_status(ucp_memh_pack(memh, &params, &buffer, &length), "ucp_memh_pack");
+  check_status(ucp_rkey_pack(context_, memh, &buffer, &length), "ucp_rkey_pack");
   return buffer;
 }
 
 void UcxStreamLane::release_packed_rkey(void *buffer) {
   if (buffer != nullptr) {
-    ucp_memh_buffer_release(buffer, nullptr);
+    ucp_rkey_buffer_release(buffer);
   }
 }
 
