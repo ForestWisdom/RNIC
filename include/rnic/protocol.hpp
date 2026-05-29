@@ -79,8 +79,6 @@ FrameHeader make_frame(FrameType type, const TransferMeta &meta,
                        const std::string &lane_name);
 void validate_frame_header(const FrameHeader &header);
 uint64_t fnv1a64(const void *data, size_t length);
-uint64_t host_to_be64(uint64_t value);
-uint64_t be64_to_host(uint64_t value);
 RmaRegionWire to_wire(const RmaRegionInfo &info);
 RmaRegionInfo from_wire(const RmaRegionWire &wire);
 std::string json_escape(const std::string &value);
