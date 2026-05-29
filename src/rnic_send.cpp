@@ -5,12 +5,14 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -162,6 +164,27 @@ std::vector<std::vector<uint64_t>> assign_chunks(const std::vector<LaneSpec> &la
   return out;
 }
 
+std::string env_value(const char *name) {
+  const char *value = std::getenv(name);
+  return value ? value : "";
+}
+
+std::string host_name() {
+  char buf[256]{};
+  if (gethostname(buf, sizeof(buf) - 1) != 0) {
+    return "";
+  }
+  return buf;
+}
+
+std::string kernel_release() {
+  struct utsname uts {};
+  if (uname(&uts) != 0) {
+    return "";
+  }
+  return uts.release;
+}
+
 void write_json(const std::string &path, const TransferMeta &meta,
                 const std::vector<LaneStats> &stats, double total_seconds,
                 uint32_t depth, const std::string &verify,
@@ -182,6 +205,11 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "{\n"
                "  \"timestamp\": \"%s\",\n"
                "  \"role\": \"sender\",\n"
+               "  \"git_commit\": \"%s\",\n"
+               "  \"hostname\": \"%s\",\n"
+               "  \"kernel\": \"%s\",\n"
+               "  \"ucx_tls\": \"%s\",\n"
+               "  \"ucx_net_devices\": \"%s\",\n"
                "  \"mode\": \"%s\",\n"
                "  \"file_size\": %llu,\n"
                "  \"chunk_size\": %u,\n"
@@ -198,7 +226,11 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"active_seconds\": %.6f,\n"
                "  \"active_throughput_mib_s\": %.3f,\n"
                "  \"lanes\": [\n",
-               now_timestamp().c_str(), json_escape(meta.mode).c_str(),
+               now_timestamp().c_str(), json_escape(env_value("GIT_COMMIT")).c_str(),
+               json_escape(host_name()).c_str(), json_escape(kernel_release()).c_str(),
+               json_escape(env_value("UCX_TLS")).c_str(),
+               json_escape(env_value("UCX_NET_DEVICES")).c_str(),
+               json_escape(meta.mode).c_str(),
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), depth, json_escape(verify).c_str(),
@@ -316,6 +348,8 @@ int main(int argc, char **argv) {
     meta.chunk_size = opt.chunk_size;
     meta.total_chunks = (size + opt.chunk_size - 1) / opt.chunk_size;
     meta.mode = opt.mode;
+    meta.verify_mode = opt.verify;
+    meta.engine = opt.engine;
 
     const bool chunk_verify = opt.verify == "chunk" || opt.verify == "both";
     const bool file_verify = opt.verify == "file" || opt.verify == "both";
@@ -349,7 +383,7 @@ int main(int argc, char **argv) {
           lane.connect();
 
           FrameHeader meta_frame = make_frame(FrameType::Meta, meta, opt.lanes[i].name);
-          meta_frame.checksum = assignments[i].size();
+          meta_frame.lane_chunks = assignments[i].size();
           lane.send_all(&meta_frame, sizeof(meta_frame));
 
           std::vector<SendSlot> slots(opt.depth);
@@ -364,7 +398,9 @@ int main(int argc, char **argv) {
           RmaRegionInfo rma_info{};
           std::vector<uint8_t> rkey_buffer;
           if (opt.engine == "rma") {
-            lane.recv_all(&rma_info, sizeof(rma_info));
+            RmaRegionWire rma_wire{};
+            lane.recv_all(&rma_wire, sizeof(rma_wire));
+            rma_info = from_wire(rma_wire);
             rkey_buffer.resize(rma_info.rkey_length);
             lane.recv_all(rkey_buffer.data(), rkey_buffer.size());
             rkey = lane.unpack_rkey(rkey_buffer.data());

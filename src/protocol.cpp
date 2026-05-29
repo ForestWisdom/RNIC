@@ -1,6 +1,7 @@
 #include "rnic/protocol.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
@@ -79,6 +80,8 @@ FrameHeader make_frame(FrameType type, const TransferMeta &meta,
   header.chunk_size = meta.chunk_size;
   copy_cstr(header.sha256_hex, sizeof(header.sha256_hex), meta.sha256_hex);
   copy_cstr(header.mode, sizeof(header.mode), meta.mode);
+  copy_cstr(header.verify_mode, sizeof(header.verify_mode), meta.verify_mode);
+  copy_cstr(header.engine, sizeof(header.engine), meta.engine);
   copy_cstr(header.lane, sizeof(header.lane), lane_name);
   return header;
 }
@@ -100,6 +103,28 @@ uint64_t fnv1a64(const void *data, size_t length) {
     hash *= 1099511628211ULL;
   }
   return hash;
+}
+
+uint64_t host_to_be64(uint64_t value) {
+  const uint32_t high = htonl(static_cast<uint32_t>(value >> 32));
+  const uint32_t low = htonl(static_cast<uint32_t>(value & 0xffffffffu));
+  return (static_cast<uint64_t>(low) << 32) | high;
+}
+
+uint64_t be64_to_host(uint64_t value) {
+  const uint32_t high = ntohl(static_cast<uint32_t>(value >> 32));
+  const uint32_t low = ntohl(static_cast<uint32_t>(value & 0xffffffffu));
+  return (static_cast<uint64_t>(low) << 32) | high;
+}
+
+RmaRegionWire to_wire(const RmaRegionInfo &info) {
+  return RmaRegionWire{host_to_be64(info.address), host_to_be64(info.length),
+                       host_to_be64(info.rkey_length)};
+}
+
+RmaRegionInfo from_wire(const RmaRegionWire &wire) {
+  return RmaRegionInfo{be64_to_host(wire.address_be), be64_to_host(wire.length_be),
+                       be64_to_host(wire.rkey_length_be)};
 }
 
 std::string json_escape(const std::string &value) {

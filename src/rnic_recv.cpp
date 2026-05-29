@@ -4,11 +4,13 @@
 
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
@@ -121,6 +123,8 @@ TransferMeta meta_from_header(const FrameHeader &header) {
   meta.chunk_size = header.chunk_size;
   meta.sha256_hex = header.sha256_hex;
   meta.mode = header.mode;
+  meta.verify_mode = header.verify_mode;
+  meta.engine = header.engine;
   return meta;
 }
 
@@ -150,9 +154,32 @@ void apply_meta(SharedState &state, const FrameHeader &header, bool sink) {
       incoming.total_chunks != state.meta.total_chunks ||
       incoming.chunk_size != state.meta.chunk_size ||
       incoming.sha256_hex != state.meta.sha256_hex ||
-      incoming.mode != state.meta.mode) {
+      incoming.mode != state.meta.mode ||
+      incoming.verify_mode != state.meta.verify_mode ||
+      incoming.engine != state.meta.engine) {
     throw std::runtime_error("lane metadata does not match previous lanes");
   }
+}
+
+std::string env_value(const char *name) {
+  const char *value = std::getenv(name);
+  return value ? value : "";
+}
+
+std::string host_name() {
+  char buf[256]{};
+  if (gethostname(buf, sizeof(buf) - 1) != 0) {
+    return "";
+  }
+  return buf;
+}
+
+std::string kernel_release() {
+  struct utsname uts {};
+  if (uname(&uts) != 0) {
+    return "";
+  }
+  return uts.release;
 }
 
 void write_json(const std::string &path, const TransferMeta &meta,
@@ -175,6 +202,11 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "{\n"
                "  \"timestamp\": \"%s\",\n"
                "  \"role\": \"receiver\",\n"
+               "  \"git_commit\": \"%s\",\n"
+               "  \"hostname\": \"%s\",\n"
+               "  \"kernel\": \"%s\",\n"
+               "  \"ucx_tls\": \"%s\",\n"
+               "  \"ucx_net_devices\": \"%s\",\n"
                "  \"mode\": \"%s\",\n"
                "  \"file_size\": %llu,\n"
                "  \"chunk_size\": %u,\n"
@@ -193,7 +225,11 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"active_seconds\": %.6f,\n"
                "  \"active_throughput_mib_s\": %.3f,\n"
                "  \"lanes\": [\n",
-               now_timestamp().c_str(), json_escape(meta.mode).c_str(),
+               now_timestamp().c_str(), json_escape(env_value("GIT_COMMIT")).c_str(),
+               json_escape(host_name()).c_str(), json_escape(kernel_release()).c_str(),
+               json_escape(env_value("UCX_TLS")).c_str(),
+               json_escape(env_value("UCX_NET_DEVICES")).c_str(),
+               json_escape(meta.mode).c_str(),
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), actual_sha.c_str(), ok ? "true" : "false",
@@ -336,7 +372,7 @@ int main(int argc, char **argv) {
           FrameHeader meta_frame{};
           lane.recv_all(&meta_frame, sizeof(meta_frame));
           apply_meta(state, meta_frame, opt.sink);
-          const uint64_t lane_expected_chunks = meta_frame.checksum;
+          const uint64_t lane_expected_chunks = meta_frame.lane_chunks;
 
           std::vector<RecvSlot> slots(opt.depth);
           const size_t frame_size = sizeof(FrameHeader) + state.meta.chunk_size;
@@ -356,7 +392,8 @@ int main(int argc, char **argv) {
             info.address = reinterpret_cast<uint64_t>(rma_buffer.data());
             info.length = rma_buffer.size();
             info.rkey_length = packed_rkey_len;
-            lane.send_all(&info, sizeof(info));
+            const RmaRegionWire info_wire = to_wire(info);
+            lane.send_all(&info_wire, sizeof(info_wire));
             lane.send_all(packed_rkey, packed_rkey_len);
 
             FrameHeader done{};

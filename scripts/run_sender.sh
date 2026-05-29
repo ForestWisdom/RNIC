@@ -13,6 +13,8 @@ RDMA_LANES="${RDMA_LANES:-1}"
 ENGINE="${ENGINE:-tag}"
 REGISTER_BUFFERS="${REGISTER_BUFFERS:-0}"
 CPU_LIST="${CPU_LIST:-}"
+GIT_COMMIT="${GIT_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)}"
+export GIT_COMMIT
 
 source_args=()
 if [ "$SOURCE" = "file" ]; then
