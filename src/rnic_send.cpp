@@ -155,6 +155,10 @@ void write_json(const std::string &path, const TransferMeta &meta,
   if (!fp) {
     throw std::runtime_error("failed to open results json: " + path);
   }
+  double active_seconds = 0.0;
+  for (const auto &s : stats) {
+    active_seconds = std::max(active_seconds, s.seconds);
+  }
   std::fprintf(fp,
                "{\n"
                "  \"timestamp\": \"%s\",\n"
@@ -169,13 +173,17 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"source\": \"%s\",\n"
                "  \"total_seconds\": %.6f,\n"
                "  \"throughput_mib_s\": %.3f,\n"
+               "  \"active_seconds\": %.6f,\n"
+               "  \"active_throughput_mib_s\": %.3f,\n"
                "  \"lanes\": [\n",
                now_timestamp().c_str(), json_escape(meta.mode).c_str(),
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), depth, json_escape(verify).c_str(),
                json_escape(source).c_str(), total_seconds,
-               (meta.file_size / 1048576.0) / total_seconds);
+               (meta.file_size / 1048576.0) / total_seconds, active_seconds,
+               active_seconds > 0.0 ? (meta.file_size / 1048576.0) / active_seconds
+                                    : 0.0);
   for (size_t i = 0; i < stats.size(); ++i) {
     const auto &s = stats[i];
     std::fprintf(fp,
@@ -349,11 +357,19 @@ int main(int argc, char **argv) {
         std::chrono::duration<double>(total_end - total_start).count();
     write_json(opt.results_json, meta, stats, total_seconds, opt.depth, opt.verify,
                opt.source);
+    double active_seconds = 0.0;
+    for (const auto &s : stats) {
+      active_seconds = std::max(active_seconds, s.seconds);
+    }
 
     std::cout << "sent file_size=" << meta.file_size
               << " chunks=" << meta.total_chunks
               << " seconds=" << total_seconds
               << " throughput_mib_s=" << (meta.file_size / 1048576.0) / total_seconds
+              << " active_seconds=" << active_seconds
+              << " active_throughput_mib_s="
+              << (active_seconds > 0.0 ? (meta.file_size / 1048576.0) / active_seconds
+                                       : 0.0)
               << "\n";
     for (const auto &s : stats) {
       std::cout << "lane=" << s.name << " chunks=" << s.chunks
