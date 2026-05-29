@@ -301,8 +301,6 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("pread failed for chunk " +
                                          std::to_string(chunk_id));
               }
-            } else {
-              std::fill(payload, payload + length, 0);
             }
 
             *header = make_frame(FrameType::Data, meta, opt.lanes[i].name);
