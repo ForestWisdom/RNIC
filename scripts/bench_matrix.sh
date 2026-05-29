@@ -65,6 +65,8 @@ if [ -n "$SENDER_HOST" ]; then
 
   run_correctness_control() {
     local case_dir="$RESULT_ROOT/correctness"
+    MODE=rdma-only RDMA_LANES=1 DEPTH=16 ENGINE=tag REGISTER_BUFFERS=1 CPU_LIST=0 \
+      VERIFY=both SOURCE=file SINK=0 collect_env_pair_control "$case_dir"
     ssh "$SENDER_HOST" "mkdir -p '$case_dir' && dd if=/dev/zero of='$TEST_FILE' bs=1M count=64 status=none"
     ssh "$REMOTE" "mkdir -p '$case_dir' '$DEFAULT_WORK_ROOT'"
     ssh "$REMOTE" "cd '$ROOT_DIR' && RESULT_DIR='$case_dir' SINK=0 MODE=rdma-only RDMA_LANES=1 DEPTH=16 VERIFY=both ENGINE=tag REGISTER_BUFFERS=1 CPU_LIST=0 OUT_FILE='${OUT_PREFIX}-correctness.bin' ./scripts/run_receiver.sh" &
@@ -130,6 +132,8 @@ run_case() {
 run_correctness() {
   local case_dir="$RESULT_ROOT/correctness"
   mkdir -p "$case_dir"
+  MODE=rdma-only RDMA_LANES=1 DEPTH=16 ENGINE=tag REGISTER_BUFFERS=1 CPU_LIST=0 \
+    VERIFY=both SOURCE=file SINK=0 collect_env_pair "$case_dir"
   dd if=/dev/zero of="$TEST_FILE" bs=1M count=64 status=none
   ssh "$REMOTE" "mkdir -p '$HOME/zhangzhisen'"
   ssh "$REMOTE" "cd '$ROOT_DIR' && RESULT_DIR='$case_dir' SINK=0 MODE=rdma-only RDMA_LANES=1 DEPTH=16 VERIFY=both ENGINE=tag REGISTER_BUFFERS=1 CPU_LIST=0 OUT_FILE='${OUT_PREFIX}-correctness.bin' ./scripts/run_receiver.sh" &
