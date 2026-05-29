@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -22,6 +23,8 @@ namespace {
 
 struct Options {
   std::string input;
+  std::string source = "file";
+  uint64_t size = 0;
   std::string mode = "hybrid";
   uint32_t chunk_size = 16 * 1024 * 1024;
   uint32_t depth = 16;
@@ -33,7 +36,8 @@ struct Options {
 void usage(const char *argv0) {
   std::cerr
       << "Usage: " << argv0
-      << " --input FILE --mode MODE --lane " << lane_spec_help(true)
+      << " [--input FILE | --source zero --size BYTES] --mode MODE --lane "
+      << lane_spec_help(true)
       << " [--lane ...] [--chunk-size BYTES] [--depth N]"
       << " [--verify none|chunk|file|both] [--results-json FILE]\n\n"
       << "Examples:\n"
@@ -58,6 +62,10 @@ Options parse_args(int argc, char **argv) {
     };
     if (arg == "--input") {
       opt.input = require_value(arg);
+    } else if (arg == "--source") {
+      opt.source = require_value(arg);
+    } else if (arg == "--size") {
+      opt.size = std::stoull(require_value(arg));
     } else if (arg == "--mode") {
       opt.mode = require_value(arg);
     } else if (arg == "--chunk-size") {
@@ -77,8 +85,14 @@ Options parse_args(int argc, char **argv) {
       throw std::runtime_error("unknown argument: " + arg);
     }
   }
-  if (opt.input.empty()) {
+  if (opt.source != "file" && opt.source != "zero") {
+    throw std::runtime_error("--source must be file or zero");
+  }
+  if (opt.source == "file" && opt.input.empty()) {
     throw std::runtime_error("--input is required");
+  }
+  if (opt.source == "zero" && opt.size == 0) {
+    throw std::runtime_error("--size is required for --source zero");
   }
   if (opt.lanes.empty()) {
     throw std::runtime_error("at least one --lane is required");
@@ -132,7 +146,8 @@ std::vector<std::vector<uint64_t>> assign_chunks(const std::vector<LaneSpec> &la
 
 void write_json(const std::string &path, const TransferMeta &meta,
                 const std::vector<LaneStats> &stats, double total_seconds,
-                uint32_t depth, const std::string &verify) {
+                uint32_t depth, const std::string &verify,
+                const std::string &source) {
   if (path.empty()) {
     return;
   }
@@ -151,6 +166,7 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"sha256\": \"%s\",\n"
                "  \"depth\": %u,\n"
                "  \"verify\": \"%s\",\n"
+               "  \"source\": \"%s\",\n"
                "  \"total_seconds\": %.6f,\n"
                "  \"throughput_mib_s\": %.3f,\n"
                "  \"lanes\": [\n",
@@ -158,7 +174,7 @@ void write_json(const std::string &path, const TransferMeta &meta,
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), depth, json_escape(verify).c_str(),
-               total_seconds,
+               json_escape(source).c_str(), total_seconds,
                (meta.file_size / 1048576.0) / total_seconds);
   for (size_t i = 0; i < stats.size(); ++i) {
     const auto &s = stats[i];
@@ -226,7 +242,7 @@ SendSlot &free_slot(UcxStreamLane &lane, std::vector<SendSlot> &slots) {
 int main(int argc, char **argv) {
   try {
     const Options opt = parse_args(argc, argv);
-    const uint64_t size = file_size(opt.input);
+    const uint64_t size = opt.source == "file" ? file_size(opt.input) : opt.size;
     TransferMeta meta;
     meta.file_size = size;
     meta.chunk_size = opt.chunk_size;
@@ -235,14 +251,16 @@ int main(int argc, char **argv) {
 
     const bool chunk_verify = opt.verify == "chunk" || opt.verify == "both";
     const bool file_verify = opt.verify == "file" || opt.verify == "both";
-    if (file_verify) {
+    if (file_verify && opt.source == "file") {
       std::cerr << "Computing SHA256 for " << opt.input << "...\n";
       meta.sha256_hex = sha256_file_hex(opt.input);
       std::cerr << "SHA256: " << meta.sha256_hex << "\n";
+    } else if (file_verify && opt.source != "file") {
+      throw std::runtime_error("--verify file/both requires --source file");
     }
 
-    const int fd = open(opt.input.c_str(), O_RDONLY);
-    if (fd < 0) {
+    const int fd = opt.source == "file" ? open(opt.input.c_str(), O_RDONLY) : -1;
+    if (opt.source == "file" && fd < 0) {
       throw std::runtime_error("failed to open input file: " + opt.input);
     }
 
@@ -277,10 +295,14 @@ int main(int argc, char **argv) {
                                                          meta.file_size - offset));
             auto *header = reinterpret_cast<FrameHeader *>(slot.buffer.data());
             uint8_t *payload = slot.buffer.data() + sizeof(FrameHeader);
-            ssize_t n = pread(fd, payload, length, static_cast<off_t>(offset));
-            if (n != static_cast<ssize_t>(length)) {
-              throw std::runtime_error("pread failed for chunk " +
-                                       std::to_string(chunk_id));
+            if (opt.source == "file") {
+              ssize_t n = pread(fd, payload, length, static_cast<off_t>(offset));
+              if (n != static_cast<ssize_t>(length)) {
+                throw std::runtime_error("pread failed for chunk " +
+                                         std::to_string(chunk_id));
+              }
+            } else {
+              std::fill(payload, payload + length, 0);
             }
 
             *header = make_frame(FrameType::Data, meta, opt.lanes[i].name);
@@ -312,7 +334,9 @@ int main(int argc, char **argv) {
     for (auto &thread : threads) {
       thread.join();
     }
-    close(fd);
+    if (fd >= 0) {
+      close(fd);
+    }
     if (failed) {
       for (const auto &error : errors) {
         if (!error.empty()) {
@@ -325,7 +349,8 @@ int main(int argc, char **argv) {
     const auto total_end = std::chrono::steady_clock::now();
     const double total_seconds =
         std::chrono::duration<double>(total_end - total_start).count();
-    write_json(opt.results_json, meta, stats, total_seconds, opt.depth, opt.verify);
+    write_json(opt.results_json, meta, stats, total_seconds, opt.depth, opt.verify,
+               opt.source);
 
     std::cout << "sent file_size=" << meta.file_size
               << " chunks=" << meta.total_chunks
