@@ -114,7 +114,7 @@ void UcxStreamLane::init_ucx() {
 
   ucp_params_t params{};
   params.field_mask = UCP_PARAM_FIELD_FEATURES;
-  params.features = UCP_FEATURE_STREAM | UCP_FEATURE_TAG;
+  params.features = UCP_FEATURE_STREAM | UCP_FEATURE_TAG | UCP_FEATURE_RMA;
   check_status(ucp_init(&params, config_, &context_), "ucp_init");
 
   ucp_worker_params_t worker_params{};
@@ -122,6 +122,51 @@ void UcxStreamLane::init_ucx() {
   worker_params.thread_mode = UCS_THREAD_MODE_SINGLE;
   check_status(ucp_worker_create(context_, &worker_params, &worker_),
                "ucp_worker_create");
+}
+
+ucp_mem_h UcxStreamLane::map_memory(void *address, size_t length) {
+  ucp_mem_map_params_t params{};
+  params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS |
+                      UCP_MEM_MAP_PARAM_FIELD_LENGTH |
+                      UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE;
+  params.address = address;
+  params.length = length;
+  params.memory_type = UCS_MEMORY_TYPE_HOST;
+  ucp_mem_h memh = nullptr;
+  check_status(ucp_mem_map(context_, &params, &memh), "ucp_mem_map");
+  return memh;
+}
+
+void UcxStreamLane::unmap_memory(ucp_mem_h memh) {
+  if (memh != nullptr) {
+    check_status(ucp_mem_unmap(context_, memh), "ucp_mem_unmap");
+  }
+}
+
+void *UcxStreamLane::pack_rkey(ucp_mem_h memh, size_t &length) {
+  void *buffer = nullptr;
+  length = 0;
+  ucp_memh_pack_params_t params{};
+  check_status(ucp_memh_pack(memh, &params, &buffer, &length), "ucp_memh_pack");
+  return buffer;
+}
+
+void UcxStreamLane::release_packed_rkey(void *buffer) {
+  if (buffer != nullptr) {
+    ucp_memh_buffer_release(buffer, nullptr);
+  }
+}
+
+ucp_rkey_h UcxStreamLane::unpack_rkey(const void *buffer) {
+  ucp_rkey_h rkey = nullptr;
+  check_status(ucp_ep_rkey_unpack(ep_, buffer, &rkey), "ucp_ep_rkey_unpack");
+  return rkey;
+}
+
+void UcxStreamLane::destroy_rkey(ucp_rkey_h rkey) {
+  if (rkey != nullptr) {
+    ucp_rkey_destroy(rkey);
+  }
 }
 
 void UcxStreamLane::connect() {
@@ -249,8 +294,13 @@ void UcxStreamLane::send_all(const void *data, size_t length) {
   }
 }
 
-void *UcxStreamLane::post_tag_send(const void *data, size_t length, ucp_tag_t tag) {
+void *UcxStreamLane::post_tag_send(const void *data, size_t length, ucp_tag_t tag,
+                                   ucp_mem_h memh) {
   ucp_request_param_t params{};
+  if (memh != nullptr) {
+    params.op_attr_mask = UCP_OP_ATTR_FIELD_MEMH;
+    params.memh = memh;
+  }
   ucs_status_ptr_t request = ucp_tag_send_nbx(ep_, data, length, tag, &params);
   if (UCS_PTR_IS_ERR(request)) {
     throw std::runtime_error("ucp_tag_send_nbx: " +
@@ -261,11 +311,15 @@ void *UcxStreamLane::post_tag_send(const void *data, size_t length, ucp_tag_t ta
 
 void *UcxStreamLane::post_tag_recv(void *data, size_t length, ucp_tag_t tag,
                                   ucp_tag_t tag_mask,
-                                  UcxRecvResult *immediate) {
+                                  UcxRecvResult *immediate, ucp_mem_h memh) {
   ucp_tag_recv_info_t info{};
   ucp_request_param_t params{};
   params.op_attr_mask = UCP_OP_ATTR_FIELD_RECV_INFO;
   params.recv_info.tag_info = &info;
+  if (memh != nullptr) {
+    params.op_attr_mask |= UCP_OP_ATTR_FIELD_MEMH;
+    params.memh = memh;
+  }
   ucs_status_ptr_t request =
       ucp_tag_recv_nbx(worker_, data, length, tag, tag_mask, &params);
   if (UCS_PTR_IS_ERR(request)) {
@@ -275,6 +329,21 @@ void *UcxStreamLane::post_tag_recv(void *data, size_t length, ucp_tag_t tag,
   if (request == nullptr && immediate != nullptr) {
     immediate->tag = info.sender_tag;
     immediate->length = info.length;
+  }
+  return request;
+}
+
+void *UcxStreamLane::post_put(const void *data, size_t length, uint64_t remote_addr,
+                              ucp_rkey_h rkey, ucp_mem_h memh) {
+  ucp_request_param_t params{};
+  if (memh != nullptr) {
+    params.op_attr_mask = UCP_OP_ATTR_FIELD_MEMH;
+    params.memh = memh;
+  }
+  ucs_status_ptr_t request = ucp_put_nbx(ep_, data, length, remote_addr, rkey, &params);
+  if (UCS_PTR_IS_ERR(request)) {
+    throw std::runtime_error("ucp_put_nbx: " +
+                             std::string(ucs_status_string(UCS_PTR_STATUS(request))));
   }
   return request;
 }

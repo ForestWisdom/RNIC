@@ -56,6 +56,12 @@ struct LaneStats {
   double seconds = 0.0;
 };
 
+struct RmaRegionInfo {
+  uint64_t address = 0;
+  uint64_t length = 0;
+  uint64_t rkey_length = 0;
+};
+
 LaneSpec parse_lane_spec(const std::string &spec, bool require_host);
 std::string lane_spec_help(bool sender);
 FrameHeader make_frame(FrameType type, const TransferMeta &meta,

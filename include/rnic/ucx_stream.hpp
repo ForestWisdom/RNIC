@@ -24,11 +24,21 @@ public:
   UcxStreamLane &operator=(const UcxStreamLane &) = delete;
 
   void connect();
+  ucp_mem_h map_memory(void *address, size_t length);
+  void unmap_memory(ucp_mem_h memh);
+  void *pack_rkey(ucp_mem_h memh, size_t &length);
+  void release_packed_rkey(void *buffer);
+  ucp_rkey_h unpack_rkey(const void *buffer);
+  void destroy_rkey(ucp_rkey_h rkey);
   void send_all(const void *data, size_t length);
   void recv_all(void *data, size_t length);
-  void *post_tag_send(const void *data, size_t length, ucp_tag_t tag);
+  void *post_tag_send(const void *data, size_t length, ucp_tag_t tag,
+                      ucp_mem_h memh = nullptr);
   void *post_tag_recv(void *data, size_t length, ucp_tag_t tag,
-                      ucp_tag_t tag_mask, UcxRecvResult *immediate);
+                      ucp_tag_t tag_mask, UcxRecvResult *immediate,
+                      ucp_mem_h memh = nullptr);
+  void *post_put(const void *data, size_t length, uint64_t remote_addr,
+                 ucp_rkey_h rkey, ucp_mem_h memh = nullptr);
   bool test_send(void *request);
   bool test_recv(void *request, UcxRecvResult &result);
   void progress();

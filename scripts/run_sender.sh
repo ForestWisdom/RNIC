@@ -10,6 +10,9 @@ VERIFY="${VERIFY:-chunk}"
 SOURCE="${SOURCE:-file}"
 SIZE="${SIZE:-0}"
 RDMA_LANES="${RDMA_LANES:-1}"
+ENGINE="${ENGINE:-tag}"
+REGISTER_BUFFERS="${REGISTER_BUFFERS:-0}"
+CPU_LIST="${CPU_LIST:-}"
 
 source_args=()
 if [ "$SOURCE" = "file" ]; then
@@ -20,6 +23,14 @@ elif [ "$SOURCE" = "zero" ]; then
 else
   echo "unknown SOURCE=$SOURCE; expected file or zero" >&2
   exit 2
+fi
+
+extra_args=(--engine "$ENGINE")
+if [ "$REGISTER_BUFFERS" = "1" ]; then
+  extra_args+=(--register-buffers)
+fi
+if [ -n "$CPU_LIST" ]; then
+  extra_args+=(--cpu-list "$CPU_LIST")
 fi
 
 rdma_sender_lanes=()
@@ -38,6 +49,7 @@ case "$MODE" in
       --chunk-size "$CHUNK_SIZE" \
       --depth "$DEPTH" \
       --verify "$VERIFY" \
+      "${extra_args[@]}" \
       --lane "nic,10.102.0.239,5001,tcp,eno1np0,1" \
       --results-json "$RESULT_DIR/send-nic-only.json"
     ;;
@@ -48,6 +60,7 @@ case "$MODE" in
       --chunk-size "$CHUNK_SIZE" \
       --depth "$DEPTH" \
       --verify "$VERIFY" \
+      "${extra_args[@]}" \
       "${rdma_sender_lanes[@]}" \
       --results-json "$RESULT_DIR/send-rdma-only.json"
     ;;
@@ -58,6 +71,7 @@ case "$MODE" in
       --chunk-size "$CHUNK_SIZE" \
       --depth "$DEPTH" \
       --verify "$VERIFY" \
+      "${extra_args[@]}" \
       --lane "nic,10.102.0.239,5001,tcp,eno1np0,15" \
       --lane "rdma,192.168.2.248,5002,rc_mlx5+ud_mlx5,mlx5_0:1,85" \
       --results-json "$RESULT_DIR/send-hybrid.json"

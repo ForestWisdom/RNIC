@@ -3,6 +3,7 @@
 #include "rnic/ucx_stream.hpp"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -14,6 +15,7 @@
 #include <exception>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
@@ -29,6 +31,9 @@ struct Options {
   uint32_t chunk_size = 16 * 1024 * 1024;
   uint32_t depth = 16;
   std::string verify = "chunk";
+  std::string engine = "tag";
+  bool register_buffers = false;
+  std::string cpu_list;
   std::vector<LaneSpec> lanes;
   std::string results_json;
 };
@@ -39,7 +44,8 @@ void usage(const char *argv0) {
       << " [--input FILE | --source zero --size BYTES] --mode MODE --lane "
       << lane_spec_help(true)
       << " [--lane ...] [--chunk-size BYTES] [--depth N]"
-      << " [--verify none|chunk|file|both] [--results-json FILE]\n\n"
+      << " [--verify none|chunk|file|both] [--engine tag|rma]"
+      << " [--register-buffers] [--cpu-list LIST] [--results-json FILE]\n\n"
       << "Examples:\n"
       << "  " << argv0
       << " --input model.bin --mode nic-only "
@@ -74,6 +80,12 @@ Options parse_args(int argc, char **argv) {
       opt.depth = static_cast<uint32_t>(std::stoul(require_value(arg)));
     } else if (arg == "--verify") {
       opt.verify = require_value(arg);
+    } else if (arg == "--engine") {
+      opt.engine = require_value(arg);
+    } else if (arg == "--register-buffers") {
+      opt.register_buffers = true;
+    } else if (arg == "--cpu-list") {
+      opt.cpu_list = require_value(arg);
     } else if (arg == "--lane") {
       opt.lanes.push_back(parse_lane_spec(require_value(arg), true));
     } else if (arg == "--results-json") {
@@ -106,6 +118,12 @@ Options parse_args(int argc, char **argv) {
   if (opt.verify != "none" && opt.verify != "chunk" && opt.verify != "file" &&
       opt.verify != "both") {
     throw std::runtime_error("--verify must be none, chunk, file, or both");
+  }
+  if (opt.engine != "tag" && opt.engine != "rma") {
+    throw std::runtime_error("--engine must be tag or rma");
+  }
+  if (opt.engine == "rma" && (opt.source != "zero" || opt.verify != "none")) {
+    throw std::runtime_error("--engine rma currently requires --source zero --verify none");
   }
   return opt;
 }
@@ -147,7 +165,8 @@ std::vector<std::vector<uint64_t>> assign_chunks(const std::vector<LaneSpec> &la
 void write_json(const std::string &path, const TransferMeta &meta,
                 const std::vector<LaneStats> &stats, double total_seconds,
                 uint32_t depth, const std::string &verify,
-                const std::string &source) {
+                const std::string &source, const std::string &engine,
+                bool register_buffers, const std::string &cpu_list) {
   if (path.empty()) {
     return;
   }
@@ -171,6 +190,9 @@ void write_json(const std::string &path, const TransferMeta &meta,
                "  \"depth\": %u,\n"
                "  \"verify\": \"%s\",\n"
                "  \"source\": \"%s\",\n"
+               "  \"engine\": \"%s\",\n"
+               "  \"register_buffers\": %s,\n"
+               "  \"cpu_list\": \"%s\",\n"
                "  \"total_seconds\": %.6f,\n"
                "  \"throughput_mib_s\": %.3f,\n"
                "  \"active_seconds\": %.6f,\n"
@@ -180,7 +202,9 @@ void write_json(const std::string &path, const TransferMeta &meta,
                static_cast<unsigned long long>(meta.file_size), meta.chunk_size,
                static_cast<unsigned long long>(meta.total_chunks),
                meta.sha256_hex.c_str(), depth, json_escape(verify).c_str(),
-               json_escape(source).c_str(), total_seconds,
+               json_escape(source).c_str(), json_escape(engine).c_str(),
+               register_buffers ? "true" : "false", json_escape(cpu_list).c_str(),
+               total_seconds,
                (meta.file_size / 1048576.0) / total_seconds, active_seconds,
                active_seconds > 0.0 ? (meta.file_size / 1048576.0) / active_seconds
                                     : 0.0);
@@ -200,9 +224,45 @@ void write_json(const std::string &path, const TransferMeta &meta,
 
 struct SendSlot {
   std::vector<uint8_t> buffer;
+  ucp_mem_h memh = nullptr;
   void *request = nullptr;
   uint64_t bytes = 0;
 };
+
+std::vector<int> parse_cpu_list(const std::string &value) {
+  std::vector<int> cpus;
+  if (value.empty()) {
+    return cpus;
+  }
+  std::stringstream ss(value);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    const auto dash = item.find('-');
+    if (dash == std::string::npos) {
+      cpus.push_back(std::stoi(item));
+    } else {
+      const int begin = std::stoi(item.substr(0, dash));
+      const int end = std::stoi(item.substr(dash + 1));
+      for (int cpu = begin; cpu <= end; ++cpu) {
+        cpus.push_back(cpu);
+      }
+    }
+  }
+  return cpus;
+}
+
+void bind_thread_to_cpu(const std::vector<int> &cpus, size_t lane_index) {
+  if (cpus.empty()) {
+    return;
+  }
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpus[lane_index % cpus.size()], &set);
+  const int rc = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+  if (rc != 0) {
+    throw std::runtime_error("pthread_setaffinity_np failed");
+  }
+}
 
 void wait_for_one(UcxStreamLane &lane, std::vector<SendSlot> &slots) {
   while (true) {
@@ -273,6 +333,7 @@ int main(int argc, char **argv) {
     }
 
     const auto assignments = assign_chunks(opt.lanes, meta.total_chunks);
+    const auto cpus = parse_cpu_list(opt.cpu_list);
     std::vector<LaneStats> stats(opt.lanes.size());
     std::atomic<bool> failed{false};
     std::vector<std::string> errors(opt.lanes.size());
@@ -282,6 +343,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < opt.lanes.size(); ++i) {
       threads.emplace_back([&, i]() {
         try {
+          bind_thread_to_cpu(cpus, i);
           stats[i].name = opt.lanes[i].name;
           UcxStreamLane lane(opt.lanes[i], false);
           lane.connect();
@@ -293,8 +355,20 @@ int main(int argc, char **argv) {
           std::vector<SendSlot> slots(opt.depth);
           for (auto &slot : slots) {
             slot.buffer.resize(sizeof(FrameHeader) + meta.chunk_size);
+            if (opt.register_buffers) {
+              slot.memh = lane.map_memory(slot.buffer.data(), slot.buffer.size());
+            }
           }
           const auto lane_start = std::chrono::steady_clock::now();
+          ucp_rkey_h rkey = nullptr;
+          RmaRegionInfo rma_info{};
+          std::vector<uint8_t> rkey_buffer;
+          if (opt.engine == "rma") {
+            lane.recv_all(&rma_info, sizeof(rma_info));
+            rkey_buffer.resize(rma_info.rkey_length);
+            lane.recv_all(rkey_buffer.data(), rkey_buffer.size());
+            rkey = lane.unpack_rkey(rkey_buffer.data());
+          }
           for (uint64_t chunk_id : assignments[i]) {
             SendSlot &slot = free_slot(lane, slots);
             const uint64_t offset = chunk_id * meta.chunk_size;
@@ -311,25 +385,40 @@ int main(int argc, char **argv) {
               }
             }
 
-            *header = make_frame(FrameType::Data, meta, opt.lanes[i].name);
-            header->chunk_id = chunk_id;
-            header->offset = offset;
-            header->length = length;
-            header->checksum = chunk_verify ? fnv1a64(payload, length) : 0;
-            const size_t frame_len = sizeof(FrameHeader) + length;
-            slot.request = lane.post_tag_send(slot.buffer.data(), frame_len,
-                                              static_cast<ucp_tag_t>(chunk_id + 1));
+            if (opt.engine == "tag") {
+              *header = make_frame(FrameType::Data, meta, opt.lanes[i].name);
+              header->chunk_id = chunk_id;
+              header->offset = offset;
+              header->length = length;
+              header->checksum = chunk_verify ? fnv1a64(payload, length) : 0;
+              const size_t frame_len = sizeof(FrameHeader) + length;
+              slot.request = lane.post_tag_send(slot.buffer.data(), frame_len,
+                                                static_cast<ucp_tag_t>(chunk_id + 1),
+                                                slot.memh);
+            } else {
+              const uint64_t remote_addr =
+                  rma_info.address + (chunk_id % opt.depth) * meta.chunk_size;
+              slot.request = lane.post_put(payload, length, remote_addr, rkey,
+                                           slot.memh);
+            }
             slot.bytes = length;
             stats[i].chunks += 1;
             stats[i].bytes += length;
           }
           wait_for_all(lane, slots);
+          if (rkey != nullptr) {
+            lane.destroy_rkey(rkey);
+          }
 
           FrameHeader done = make_frame(FrameType::Done, meta, opt.lanes[i].name);
           lane.send_all(&done, sizeof(done));
           const auto lane_end = std::chrono::steady_clock::now();
           stats[i].seconds =
               std::chrono::duration<double>(lane_end - lane_start).count();
+          for (auto &slot : slots) {
+            lane.unmap_memory(slot.memh);
+            slot.memh = nullptr;
+          }
         } catch (const std::exception &ex) {
           errors[i] = ex.what();
           failed = true;
@@ -356,7 +445,7 @@ int main(int argc, char **argv) {
     const double total_seconds =
         std::chrono::duration<double>(total_end - total_start).count();
     write_json(opt.results_json, meta, stats, total_seconds, opt.depth, opt.verify,
-               opt.source);
+               opt.source, opt.engine, opt.register_buffers, opt.cpu_list);
     double active_seconds = 0.0;
     for (const auto &s : stats) {
       active_seconds = std::max(active_seconds, s.seconds);

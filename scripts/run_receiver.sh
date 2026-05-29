@@ -9,10 +9,21 @@ SINK="${SINK:-0}"
 DEPTH="${DEPTH:-16}"
 VERIFY="${VERIFY:-chunk}"
 RDMA_LANES="${RDMA_LANES:-1}"
+ENGINE="${ENGINE:-tag}"
+REGISTER_BUFFERS="${REGISTER_BUFFERS:-0}"
+CPU_LIST="${CPU_LIST:-}"
 
 sink_args=()
 if [ "$SINK" = "1" ]; then
   sink_args+=(--sink)
+fi
+
+extra_args=(--engine "$ENGINE")
+if [ "$REGISTER_BUFFERS" = "1" ]; then
+  extra_args+=(--register-buffers)
+fi
+if [ -n "$CPU_LIST" ]; then
+  extra_args+=(--cpu-list "$CPU_LIST")
 fi
 
 rdma_receiver_lanes=()
@@ -30,6 +41,7 @@ case "$MODE" in
       --lane "nic,10.102.0.239,5001,tcp,ens11" \
       --depth "$DEPTH" \
       --verify "$VERIFY" \
+      "${extra_args[@]}" \
       --results-json "$RESULT_DIR/recv-nic-only.json" \
       "${sink_args[@]}"
     ;;
@@ -39,6 +51,7 @@ case "$MODE" in
       "${rdma_receiver_lanes[@]}" \
       --depth "$DEPTH" \
       --verify "$VERIFY" \
+      "${extra_args[@]}" \
       --results-json "$RESULT_DIR/recv-rdma-only.json" \
       "${sink_args[@]}"
     ;;
@@ -49,6 +62,7 @@ case "$MODE" in
       --lane "rdma,192.168.2.248,5002,rc_mlx5+ud_mlx5,mlx5_0:1" \
       --depth "$DEPTH" \
       --verify "$VERIFY" \
+      "${extra_args[@]}" \
       --results-json "$RESULT_DIR/recv-hybrid.json" \
       "${sink_args[@]}"
     ;;
